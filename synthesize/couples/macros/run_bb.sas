@@ -1,0 +1,178 @@
+
+%macro run_bb;
+  libname metadata "metadata";
+  data metadata.pid_m&m._mjob&mjob.;
+    pid=&sysjobid.;
+  run;
+
+  %include "macros/fastbb.sas";
+  %local mnobs nstrata i stratum msize;
+  libname impwork "&impwork.";
+
+  *** get count of observations in this cluster for imputation set;
+  %let mnobs=0;
+  data _null_;
+    set impwork.mstrata&mjob._list&s. nobs=nobs;
+    call symput("mnobs",compress(put(nobs,12.)));
+    stop;
+  run;
+  *** get number of strata in this cluster;
+  %let nstrata=0;
+  data strata_size;
+    set impwork.strata_size_list&s. end=lastobs;
+    retain _count_ 0;
+    if _cluster_=&mjob. then do;
+      _count_=_count_+1;
+      output;
+    end;
+    if lastobs then call symput("nstrata",compress(put(_count_,12.)));
+  run;
+  %do i=1 %to &nstrata.;
+    %local fobs&i. fobs_m&i.;
+    %let fobs&i.=0;
+    %let fobs_m&i.=0;
+  %end;
+  %if &mnobs.>0 %then %do;
+    *** get observation numbers for first obs of each stratum in both estimation and imputation sets;
+    data _null_;
+      set impwork.strata&mjob._list&s.;
+      by _stratum_;
+      retain _count_ 0;
+      if first._stratum_ then do;
+        _count_=_count_+1;
+        call symput("fobs" || compress(put(_count_,12.)),compress(put(_n_,12.)));
+      end;
+    run;
+    data impwork.mstrata&mjob._list&s. (drop=_count_);
+      set impwork.mstrata&mjob._list&s.;
+      by _stratum_;
+      retain _count_ 0;
+      tobs1=_n_;
+      if first._stratum_ then do;
+        _count_=_count_+1;
+        call symput("fobs_m" || compress(put(_count_,12.)),compress(put(_n_,12.)));
+      end;
+    run;
+    *** loop over strata in this cluster;
+    %do i=1 %to &nstrata.;
+      *** check to make sure nothing went wrong in assigning stratum pointers;
+      %put FOBS&i.=&&fobs&i.. FOBS_M&i.=&&fobs_m&i..;
+      %let check_fobs=0;
+      %if &&fobs&i..=0 %then %do;
+        %put ERROR: Stratum not found in estimation set;
+        %let check_fobs=1;
+      %end;
+      %if &&fobs_m&i..=0 %then %do;
+        %put ERROR: Stratum not found in imputation set;
+        %let check_fobs=1;
+      %end;
+      %if &check_fobs.=1 %then %do;
+        data _null_;
+          abort abend;
+        run;
+      %end;
+      data _null_;
+        set strata_size (firstobs=&i.);
+        call symput("stratum",compress(put(_stratum_,12.)));
+        stop;
+      run;
+      *** prepare this imputation stratum for modifying the cluster after imputation;
+      %let msize=0;
+      data mstratum (drop=tobs1 _count_);
+        set impwork.mstrata&mjob._list&s. (firstobs=&&fobs_m&i..) end=lastobs;
+        retain _count_ 0;
+        tobs2=tobs1;
+        if _stratum_=&stratum. then do;
+          _count_=_count_+1;
+          output;
+        end;
+        else do;
+          call symput("msize",compress(put(_count_,12.)));
+          stop;
+        end;
+        if lastobs then call symput("msize",compress(put(_count_,12.)));
+      run;
+      data stratum;
+        set impwork.strata&mjob._list&s. (firstobs=&&fobs&i..);
+        if _stratum_=&stratum. then output;
+        else stop;
+      run;
+      %put *********** begin the impute *************;
+      %fastbb(stratum,bbstratum,&curvar. &output_vars.,outsize=&msize.,seed=&seed.,suffix=);
+      %let seed=&outseed.;
+      %put *********** end the impute ***************;
+      data mstratum;
+        set mstratum (keep=_idobs_ tobs2);
+        set bbstratum (keep=&curvar. &output_vars.);
+        _stratum_=&stratum.;
+      run;
+      *** modify the cluster with the newly imputed values;
+      %macro rename_others;
+        %local i var;
+        %if "&output_vars."~="" %then %do;
+          %let i=1;
+          %do %until("%scan(&output_vars.,&i.)"="");
+            %let var=%scan(&output_vars.,&i.);
+            &var.=imputed_others&i.
+            %let i=%eval(&i.+1);
+          %end;
+        %end;
+      %mend;
+      %macro reassign_others;
+        %local i var;
+        %if "&output_vars."~="" %then %do;
+          %let i=1;
+          %do %until("%scan(&output_vars.,&i.)"="");
+            %let var=%scan(&output_vars.,&i.);
+            &var.=imputed_others&i.;
+            %let i=%eval(&i.+1);
+          %end;
+        %end;
+      %mend;
+      data impwork.mstrata&mjob._list&s.;
+        set mstratum (rename=(&curvar.=imputed %rename_others));
+        modify impwork.mstrata&mjob._list&s. point=tobs2;
+        if _error_=1 then do;
+          put 'WARNING: occurred for TOBS=' tobs2 /
+          'during DATA step iteration' _n_ /
+          'TOBS value may be out of range.';
+          _error_=0;
+          stop;
+        end;
+        &curvar.=imputed;
+        %reassign_others;
+      run;
+      proc datasets lib=work nolist;
+        %if %sysfunc(exist(stratum)) %then %do;
+          delete stratum;
+        %end; 
+        %if %sysfunc(exist(mstratum)) %then %do;
+          delete mstratum;
+        %end; 
+        %if %sysfunc(exist(bbstratum)) %then %do;
+          delete bbstratum;
+        %end; 
+      run;
+    %end; /* end of i-loop over strata */
+    proc datasets lib=work nolist;
+      %if %sysfunc(exist(strata_size)) %then %do;
+        delete strata_size;
+      %end; 
+    run;
+  %end; /* end of if-clause imputation file exists */
+
+  /***
+   If there was an error in this remote job setting OBS=0,
+   then this next step will fail -- allowing us to test
+   for such an error in the parent job.
+  ***/
+  data impwork.test4obs_set_to_zero_&mjob.;
+    set impwork.test4obs_set_to_zero_&mjob. end=lastobs;
+    output;
+    if lastobs then do;
+      i=2; output;
+    end;
+  run;
+%mend;
+
+
